@@ -1596,14 +1596,20 @@ export function modelWithCurrentPromotion(model: WorkBuddyUpstreamModel, now = D
 /**
  * Prepare a body for the **CN** endpoint.
  *
- * Until #87 the CN wire was the caller's body verbatim. The only difference
- * now is the shared {@link dropUnsupportedEffort} strip, whose region scope was
- * lifted once measurements showed this endpoint rejects `off` too.
+ * Until #87 the CN wire was the caller's body verbatim. Two endpoint-specific
+ * steps now belong here: the shared {@link dropUnsupportedEffort} strip, whose
+ * region scope was lifted once measurements showed this endpoint rejects `off`
+ * too, and {@link normalizeChannelSignature}, which neutralizes the DSH opener
+ * this endpoint's channel check rejects (issue #201).
  *
  * Deliberately **not** routed through {@link prepareChatBody}: the shim already
  * applies it before handing the body to {@link WorkBuddyUpstreamClient.chatStream},
  * and re-running it would be a second `stream`/`developer`/`tool_choice`
- * normalisation of an already-normalised body. Only the strip belongs here.
+ * normalisation of an already-normalised body. These two steps belong here
+ * instead — the second is idempotent, so the shim's earlier pass costs nothing.
+ * Measured against the real gateway 2026-10-21: a direct `chatStream` call
+ * carrying the raw opener is still answered 400/11128 unless this runs, so a
+ * caller that bypasses the shim must not reopen the blocked path.
  *
  * A body that is not a JSON object is returned unchanged, so this is safe to
  * run over an already-prepared-or-not body.
@@ -1618,6 +1624,7 @@ export function prepareCnChatBody(source: string): string {
   }
   if (!isObject(body)) return source
   dropUnsupportedEffort(body)
+  normalizeChannelSignature(body)
   return JSON.stringify(body)
 }
 

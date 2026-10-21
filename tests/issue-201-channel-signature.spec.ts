@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { prepareChatBody } from '../src/upstream.ts'
+import { prepareChatBody, prepareCnChatBody } from '../src/upstream.ts'
 
 /**
  * Wire pin for issue #201: since 2026-10-20 the CN gateway
@@ -130,5 +130,41 @@ describe('DSH opener channel check (issue #201)', () => {
   it('returns invalid JSON and JSON arrays unchanged, as the shared preparer does', () => {
     expect(prepareChatBody('not json')).toBe('not json')
     expect(prepareChatBody('[1,2]')).toBe('[1,2]')
+  })
+})
+
+describe('the CN wire path carries the same rewrite (issue #201)', () => {
+  it('neutralizes the opener when chatStream is handed an unprepared body', () => {
+    // `chatStream` calls `prepareCnChatBody`, not `prepareChatBody`. The shim
+    // normally prepares the body first, but a direct caller bypasses that, and
+    // the CN gateway is exactly where the opener is rejected. Measured against
+    // the live endpoint 2026-10-21: without this step the request is still
+    // answered 400/11128 「请求被拦截，请重新发送」.
+    const wire = JSON.parse(prepareCnChatBody(JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      messages: [{ role: 'system', content: OPENER }, { role: 'user', content: 'hi' }],
+    }))) as Record<string, unknown>
+    expect(systemContent(wire)).toBe(`You are an AI agent powered by DeepSeek${ZWSP} Harness.`)
+  })
+
+  it('leaves an already-prepared body as the shim left it', () => {
+    // The shim's pass already neutralized the opener, so this second one is a
+    // no-op rather than a second edit — the rewrite is idempotent.
+    const shimPrepared = prepareChatBody(JSON.stringify({
+      messages: [{ role: 'system', content: OPENER }, { role: 'user', content: 'hi' }],
+    }))
+    const wire = prepareCnChatBody(shimPrepared)
+    expect(wire).toBe(shimPrepared)
+    expect(wire.split(ZWSP).length - 1).toBe(1)
+  })
+
+  it('keeps user text byte-identical on the CN path too', () => {
+    const wire = JSON.parse(prepareCnChatBody(JSON.stringify({
+      messages: [
+        { role: 'system', content: 'You are a helpful assistant.' },
+        { role: 'user', content: OPENER },
+      ],
+    }))) as Record<string, unknown>
+    expect(messages(wire)[1]!['content']).toBe(OPENER)
   })
 })
