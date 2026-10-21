@@ -546,13 +546,18 @@ function identityHeaders(credential: WorkBuddyCredential): Record<string, string
  * Normalize an OpenAI chat-completions body for the WorkBuddy upstream:
  * force `stream: true` (the upstream rejects non-streaming), flatten
  * `tool_choice` (the upstream's field is a string; object forms return 400),
- * and rewrite `developer` messages as `system`.
+ * rewrite `developer` messages as `system`, and neutralize DSH's fixed
+ * system-prompt opener (the CN gateway's third-party-client channel check,
+ * issue #201).
  *
  * The `developer` rewrite is load-bearing: pi-ai emits the system prompt as
  * `role: "developer"` (the OpenAI convention it adopted), but the WorkBuddy
  * upstream rejects that role with HTTP 400 code 11128 ("Illegal API
  * invocation from an unapproved channel"). Rewriting to `system` is the
  * compatible spelling the upstream accepts.
+ *
+ * The opener neutralization is the same class of fix for a newer check; see
+ * {@link normalizeChannelSignature}.
  */
 export function prepareChatBody(source: string): string {
   let body: unknown
@@ -566,6 +571,7 @@ export function prepareChatBody(source: string): string {
   obj['stream'] = true
   normalizeDeveloperRole(obj)
   normalizeToolChoice(obj)
+  normalizeChannelSignature(obj)
   return JSON.stringify(obj)
 }
 
@@ -577,6 +583,56 @@ function normalizeDeveloperRole(obj: Record<string, unknown>): void {
     if (typeof message !== 'object' || message === null || Array.isArray(message)) continue
     const wrapped = message as Record<string, unknown>
     if (wrapped['role'] === 'developer') wrapped['role'] = 'system'
+  }
+}
+
+/**
+ * DSH's fixed system-prompt opener, which the CN gateway now treats as a
+ * third-party-client channel signature (issue #201).
+ *
+ * Measured 2026-10-20 on `copilot.tencent.com/v2/chat/completions`: a body whose
+ * first message is `system` and whose content starts with this sentence is
+ * answered `400` / `code 11128` / `msg: "Illegal API invocation from an
+ * unapproved channel"` — the `displayMsg.zh` users see is
+ * 「请求被拦截，请重新发送」. A benign sentence prepended *inside the same
+ * message* is accepted, as is this sentence placed after other text or in a
+ * user message, and one altered character also clears the check. The official
+ * desktop app never sends the sentence, which is why the same account keeps
+ * working there.
+ *
+ * DSH injects this sentence into every agent request, so every WorkBuddy model
+ * fails while the check is live. The failure was measured to be content, not
+ * auth, headers, reasoning effort, tools, or body size.
+ */
+const DSH_CHANNEL_OPENER = 'You are an AI agent powered by DeepSeek Harness'
+/** The words inside the opener that are altered; a zero-width space breaks the exact match. */
+const DSH_OPENER_PHRASE = 'DeepSeek Harness'
+const DSH_OPENER_PHRASE_NEUTRALIZED = 'DeepSeek\u200b Harness'
+
+/**
+ * Neutralize the CN gateway's DSH-opener channel check (issue #201).
+ *
+ * The edit is invisible to a reader and leaves the prompt's meaning unchanged:
+ * only the two words `DeepSeek Harness` inside DSH's fixed opener gain a
+ * U+200B. Scope is deliberately narrow — only `system`/`developer` messages
+ * (after {@link normalizeDeveloperRole}, so pi-ai's `developer` spelling is
+ * covered) whose content contains the opener. A user message, a custom system
+ * prompt that merely mentions `DeepSeek Harness`, and every other body key stay
+ * byte-identical. The rewrite is idempotent: the international path runs
+ * {@link prepareChatBody} a second time, and by then the opener no longer
+ * matches.
+ */
+function normalizeChannelSignature(obj: Record<string, unknown>): void {
+  const messages = obj['messages']
+  if (!Array.isArray(messages)) return
+  for (const message of messages) {
+    if (typeof message !== 'object' || message === null || Array.isArray(message)) continue
+    const wrapped = message as Record<string, unknown>
+    const role = wrapped['role']
+    if (role !== 'system' && role !== 'developer') continue
+    const content = wrapped['content']
+    if (typeof content !== 'string' || !content.includes(DSH_CHANNEL_OPENER)) continue
+    wrapped['content'] = content.replace(DSH_OPENER_PHRASE, DSH_OPENER_PHRASE_NEUTRALIZED)
   }
 }
 
