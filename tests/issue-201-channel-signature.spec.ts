@@ -114,14 +114,19 @@ describe('DSH opener channel check (issue #201)', () => {
     expect(twice.split(ZWSP).length - 1).toBe(1)
   })
 
-  it('leaves non-string system content and the rest of the body untouched', () => {
+  it('rewrites a text part in the content-parts spelling and leaves the rest of the body untouched', () => {
+    // The parts spelling is neutralized too: the gateway reads the rendered
+    // text, so a part that still reads the opener is the same rejection. Only
+    // the identity phrase changes inside the part.
     const parts = [{ type: 'text', text: OPENER }]
     const body = prepared({
       model: 'm',
       max_tokens: 128,
       messages: [{ role: 'system', content: parts }, { role: 'user', content: 'hi' }],
     })
-    expect(messages(body)[0]!['content']).toEqual(parts)
+    expect(messages(body)[0]!['content']).toEqual([
+      { type: 'text', text: `You are an AI agent powered by ${NEUTRALIZED_PHRASE}.` },
+    ])
     expect(body['model']).toBe('m')
     expect(body['max_tokens']).toBe(128)
     expect(body['stream']).toBe(true)
@@ -166,5 +171,72 @@ describe('the CN wire path carries the same rewrite (issue #201)', () => {
       ],
     }))) as Record<string, unknown>
     expect(messages(wire)[1]!['content']).toBe(OPENER)
+  })
+})
+
+describe('every occurrence is rewritten, not just the first (issue #201 follow-up)', () => {
+  it('neutralizes a repeated opener in one system message', () => {
+    // Measured against the live gateway on 2026-10-21: a first-only rewrite left
+    // the second copy on the wire, and it was still answered 400/11128.
+    const doubled = `${OPENER}\n\nYou are a coding agent.\n\nReminder: ${OPENER}`
+    const system = systemContent(prepared({
+      messages: [{ role: 'system', content: doubled }, { role: 'user', content: 'hi' }],
+    }))
+    expect(system).not.toContain('DeepSeek Harness')
+    expect(system.split(ZWSP).length - 1).toBe(2)
+    expect(system.replaceAll(ZWSP, '')).toBe(doubled)
+  })
+
+  it('neutralizes every system message that carries the opener', () => {
+    // DSH re-emits the system prompt when it changes, so a long session carries
+    // several; each one is checked by the gateway.
+    const body = prepared({
+      messages: [
+        { role: 'system', content: OPENER },
+        { role: 'user', content: 'hi' },
+        { role: 'system', content: `Update.\n\n${OPENER}` },
+      ],
+    })
+    const all = messages(body).filter(m => m['role'] === 'system') as { content: string }[]
+    expect(all).toHaveLength(2)
+    for (const message of all) expect(message.content).not.toContain('DeepSeek Harness')
+  })
+
+  it('is still idempotent with several occurrences', () => {
+    const source = JSON.stringify({
+      messages: [{ role: 'system', content: `${OPENER}\n\n${OPENER}` }, { role: 'user', content: 'hi' }],
+    })
+    const once = prepareChatBody(source)
+    expect(prepareChatBody(once)).toBe(once)
+    expect(prepareCnChatBody(once)).toBe(once)
+    expect(once.split(ZWSP).length - 1).toBe(2)
+  })
+
+  it('covers the content-parts spelling as well as a plain string', () => {
+    // pi-ai flattens parts before the wire, but a direct caller may hand them
+    // over as-is, and the gateway reads the rendered text either way.
+    const body = prepared({
+      messages: [{
+        role: 'system',
+        content: [
+          { type: 'text', text: OPENER },
+          { type: 'text', text: `${OPENER}\n\nAgain.` },
+        ],
+      }],
+    })
+    const parts = messages(body)[0]!['content'] as { type: string, text: string }[]
+    for (const part of parts) expect(part.text).not.toContain('DeepSeek Harness')
+    expect(parts.map(p => p.text.replaceAll(ZWSP, '').trimEnd()))
+      .toEqual([OPENER, `${OPENER}\n\nAgain.`])
+  })
+
+  it('leaves a user message with several occurrences untouched', () => {
+    const body = prepared({
+      messages: [
+        { role: 'system', content: 'You are a helpful assistant.' },
+        { role: 'user', content: `${OPENER} and ${OPENER}` },
+      ],
+    })
+    expect(messages(body)[1]!['content']).toBe(`${OPENER} and ${OPENER}`)
   })
 })
